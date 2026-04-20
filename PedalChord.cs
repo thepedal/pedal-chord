@@ -139,6 +139,10 @@ namespace WDE.PedalChord
         public int Speed        = 2;
         public int Length       = 4;
         public int OctaveSpread = 1;
+        public int Step         = 1;   // chord tones advanced per arp tick (1-8)
+        public int OctWalk      = 0;   // 0=Off 1=Up 2=Ping-pong
+        public int OctOffset    = 0;   // runtime: current octave offset
+        public int OctDir       = 1;   // runtime: oct walk direction (+1/-1)
         public int Swing        = 0;
         public int SwingPhaseVal = 0;  // set by SetSwingPhase parameter
         public int Velocity      = 100; // 1-127 MIDI velocity
@@ -374,6 +378,23 @@ namespace WDE.PedalChord
             _vs[track].OctaveSpread = Math.Max(1, Math.Min(4, value));
         }
 
+        [ParameterDecl(Name = "Step", MinValue = 1, MaxValue = 8, DefValue = 1,
+                       Description = "Chord tones advanced per arp step (1=every note, 2=skip one, etc.)")]
+        public void SetStep(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            _vs[track].Step = Math.Max(1, Math.Min(8, value));
+        }
+
+        [ParameterDecl(Name = "Oct Walk", MinValue = 0, MaxValue = 2, DefValue = 0,
+                       ValueDescriptions = new[] { "Off", "Up", "Ping-pong" },
+                       Description = "How the octave shifts after each full chord cycle")]
+        public void SetOctWalk(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            _vs[track].OctWalk = Math.Max(0, Math.Min(2, value));
+        }
+
         [ParameterDecl(Name = "Swing", MinValue = 0, MaxValue = 100, DefValue = 0,
                        Description = "0 = straight  |  50 = medium shuffle  |  100 = 2:1 triplet swing")]
         public void SetSwing(int value, int track)
@@ -582,6 +603,8 @@ namespace WDE.PedalChord
             vs.ArpDir   = (vs.Mode == 5) ? -1 : 1;
             vs.ArpTicks      = 0;
             vs.ArpStepParity = 0;
+            vs.OctOffset     = 0;
+            vs.OctDir        = 1;
 
             if (vs.Mode == 0)   // Chord: all notes simultaneously
             {
@@ -608,7 +631,10 @@ namespace WDE.PedalChord
                 : 0;
             int _velJitter  = _velDrift > 0 ? _rng.Next(-_velDrift, _velDrift + 1) : 0;
             int _firedVel   = Math.Max(1, Math.Min(127, vs.Velocity + _velJitter));
-            FireNote(np, m, baseTrack, vs.Notes[idx], vp, _firedVel);
+            int _midiNote = vs.Notes[idx];
+            if (vs.OctWalk != 0)
+                _midiNote = Math.Min(119, _midiNote + vs.OctOffset * 12);
+            FireNote(np, m, baseTrack, _midiNote, vp, _firedVel);
             vs.SlotTrack[0] = baseTrack;
             vs.SlotOff[0]   = vs.Length;
             if (vs.Mode != 5) AdvArp(vs);
@@ -633,16 +659,68 @@ namespace WDE.PedalChord
         void AdvArp(VoiceState vs)
         {
             int len = vs.Notes.Length;
-            if (len <= 1) return;
+            if (len <= 1) { if (vs.OctWalk != 0) AdvOct(vs); return; }
+            int s = vs.Step;
             switch (vs.Mode)
             {
-                case 1: vs.ArpIdx = (vs.ArpIdx + 1) % len; break;
-                case 2: vs.ArpIdx = (vs.ArpIdx - 1 + len) % len; break;
+                case 1: // Up — advance by Step, wrap and advance oct on each wrap
+                {
+                    int next = vs.ArpIdx + s;
+                    if (next >= len) AdvOct(vs);
+                    vs.ArpIdx = next % len;
+                    break;
+                }
+                case 2: // Down — retreat by Step
+                {
+                    int next = vs.ArpIdx - s;
+                    if (next < 0) AdvOct(vs);
+                    vs.ArpIdx = ((next % len) + len) % len;
+                    break;
+                }
                 case 3:  // Up+Down ping-pong
-                case 4:  // Down+Up ping-pong (same logic; Start() sets initial direction)
-                    vs.ArpIdx += vs.ArpDir;
-                    if (vs.ArpIdx >= len) { vs.ArpIdx = Math.Max(len - 2, 0); vs.ArpDir = -1; }
-                    else if (vs.ArpIdx < 0) { vs.ArpIdx = Math.Min(1, len - 1); vs.ArpDir = +1; }
+                case 4:  // Down+Up ping-pong
+                {
+                    vs.ArpIdx += vs.ArpDir * s;
+                    // Reflect until in range — handles step > 1 correctly.
+                    while (vs.ArpIdx >= len || vs.ArpIdx < 0)
+                    {
+                        if (vs.ArpIdx >= len)
+                        {
+                            vs.ArpIdx = 2 * (len - 1) - vs.ArpIdx;
+                            vs.ArpDir = -1;
+                            AdvOct(vs);  // completed an upward pass
+                        }
+                        if (vs.ArpIdx < 0)
+                        {
+                            vs.ArpIdx = -vs.ArpIdx;
+                            vs.ArpDir = +1;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        void AdvOct(VoiceState vs)
+        {
+            if (vs.OctWalk == 0 || vs.OctaveSpread <= 1) return;
+            switch (vs.OctWalk)
+            {
+                case 1: // Up — cycle through octaves, wrap at top
+                    vs.OctOffset = (vs.OctOffset + 1) % vs.OctaveSpread;
+                    break;
+                case 2: // Ping-pong — bounce between 0 and OctaveSpread-1
+                    vs.OctOffset += vs.OctDir;
+                    if (vs.OctOffset >= vs.OctaveSpread)
+                    {
+                        vs.OctOffset = Math.Max(0, vs.OctaveSpread - 2);
+                        vs.OctDir    = -1;
+                    }
+                    else if (vs.OctOffset < 0)
+                    {
+                        vs.OctOffset = Math.Min(1, vs.OctaveSpread - 1);
+                        vs.OctDir    = +1;
+                    }
                     break;
             }
         }
@@ -693,7 +771,9 @@ namespace WDE.PedalChord
                     }
                     else if (vs.PendingNote > 0)
                     {
-                        vs.Notes = BuildNotes(vs.PendingNote, vs.ChordType, vs.OctaveSpread);
+                        // OctWalk manages octaves at runtime; build base notes only.
+                        int _octs = vs.OctWalk != 0 ? 1 : vs.OctaveSpread;
+                        vs.Notes = BuildNotes(vs.PendingNote, vs.ChordType, _octs);
                         if (tgt != null && np != null)
                             Start(vs, np, vp, tgt, baseTrk);
                     }
@@ -766,6 +846,8 @@ namespace WDE.PedalChord
                 vs.PendingReset = false;
                 vs.ArpTicks      = 0;
                 vs.ArpStepParity = 0;
+                vs.OctOffset     = 0;
+                vs.OctDir        = 1;
                 for (int s = 0; s < MaxSlots; s++) vs.SlotOff[s] = 0;
             }
         }
