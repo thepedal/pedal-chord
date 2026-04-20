@@ -1,4 +1,4 @@
-# Pedal Chord v1.1 — ReBuzz Managed Controller Machine
+# Pedal Chord v1.2 — ReBuzz Managed Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note into Pedal Chord's
 pattern and it fires the full chord (or arpeggiated notes) on any target
@@ -24,24 +24,31 @@ that reaches Master) so its audio is heard.
 
 ## Track parameters
 
-| Parameter  | Range   | Description |
-|------------|---------|-------------|
-| **Note**   | C-0–B-9 | Root note. Standard Buzz piano keyboard (z/s/x/d/…). |
-| **Chord**  | 0–50    | Chord type — 51 chords. Right-click → *Chord Reference…* for full list with hex values. |
-| **Mode**   | 0–5     | Chord / Arp Up / Arp Down / Arp Up+Down / Arp Down+Up / Arp Random |
-| **Speed**  | 1–1024  | Pattern ticks between arpeggio steps (1 tick = 1 pattern row). |
-| **Length** | 1–64    | Note duration in ticks before auto note-off. |
-| **Octaves**| 1–4     | Octave spread — arp note list duplicated upward over 1–4 octaves. |
-| **Swing**  | 0–100   | Shuffle amount. 0 = straight, 100 ≈ 2:1 triplet shuffle. |
-| **Swing On**| 0–1   | Which beat of the alternating pair gets the long wait (0 = 1st, 1 = 2nd). |
+| Parameter   | Range   | Description |
+|-------------|---------|-------------|
+| **Note**    | C-0–B-9 | Root note. Standard Buzz piano keyboard (z/s/x/d/…). |
+| **Velocity**| 1–127   | Note velocity sent to the target machine. |
+| **Chord**   | 0–50    | Chord type — 51 chords. Right-click → *Chord Reference…* for the full list with hex values. |
+| **Mode**    | 0–5     | Chord / Arp Up / Arp Down / Arp Up+Down / Arp Down+Up / Arp Random |
+| **Speed**   | 1–1024  | Pattern ticks between arpeggio steps (1 tick = 1 pattern row). |
+| **Length**  | 1–64    | Note duration in ticks before auto note-off. |
+| **Octaves** | 1–4     | Octave spread — arp note list duplicated upward over 1–4 octaves. |
+| **Swing**   | 0–100   | Shuffle amount. 0 = straight, 100 ≈ 2:1 triplet shuffle. |
+| **Swing On**| 0–1     | Which beat of the alternating pair gets the long wait (0 = 1st, 1 = 2nd). |
+| **Humanize**| 0–100   | Random ±timing drift per arp step, scales with Speed. |
+| **Hum. Vel**| 0–100   | Random ±velocity variation per arp step, scales with Velocity. |
+| **Arp Reset**| 0–1   | Write 1 to restart the arp sequence from the first note on this step. |
 
-### Speed and timing
+---
+
+## Speed and timing
 
 Speed is measured in **pattern ticks** (rows) and is exact regardless of BPM
-or audio buffer size. With Speed=2 and a 32-tick loop you get exactly 16
-triggers.
+or audio buffer size. Speed=2 in a 32-tick loop gives exactly 16 triggers.
 
-### Swing
+---
+
+## Swing
 
 Swing alternates between a long and short wait using integer tick counts:
 
@@ -52,8 +59,40 @@ shortTicks = 2 × Speed − longTicks
 
 `long + short = 2 × Speed` always, so average tempo is locked regardless of
 swing amount. Effective swing granularity increases with Speed — at Speed=2
-only Swing=100 produces an audible effect (3:1); at Speed=4 you get 5:3; at
-Speed=8 and above the full 0–100 range gives meaningfully distinct feels.
+only Swing=100 produces an audible effect (3:1 ratio); at Speed=4+ the full
+0–100 range gives meaningfully distinct feels.
+
+**Swing On** shifts which beat of the pair gets the long wait, useful for
+landing the shuffle accent on a specific chord tone.
+
+---
+
+## Humanize
+
+**Humanize** adds random ±timing drift to each arp step:
+- Drift range = `±Round(Speed × Humanize / 200)` ticks
+- At Speed=8, Humanize=50: ±2 ticks per step
+- Non-cumulative — varies around the swing-adjusted base, so tempo never drifts
+
+**Hum. Vel** adds random ±velocity variation to each arp step:
+- Drift range = `±Round(Velocity × HumanizeVel / 200)`
+- At Velocity=100, Hum. Vel=50: ±25 per step, clamped to [1, 127]
+
+Both humanize controls only affect arp modes — chord mode fires all notes on
+the original note trigger with no timing drift.
+
+---
+
+## Arp Reset
+
+Write `01` into the **Arp Reset** column on any pattern row to restart the arp
+sequence from the first note (or last note for Down/Down+Up modes) at that
+point. The reset fires on the next tick after the row, so the restart is
+immediate.
+
+`Arp Reset` is stateless — it only fires when explicitly written. Use it to
+snap a free-running arp back to note 1 at bar boundaries, or to create accent
+patterns by forcing the arp back to the root at specific moments.
 
 ---
 
@@ -104,6 +143,25 @@ Output: `<BuzzDir>\Gear\Generators\Pedal Chord.NET.dll`
 
 ---
 
+## Changelog
+
+### v1.2
+- **Velocity** track parameter (1–127) — sets note velocity on the target
+- **Humanize** track parameter (0–100) — random ±timing drift per arp step
+- **Hum. Vel** track parameter (0–100) — random ±velocity variation per arp step
+- **Arp Reset** track parameter — write 1 to restart the arp sequence from this step
+
+### v1.1
+- **Swing** track parameter (0–100) — shuffle/swing timing
+- **Swing On** track parameter (0/1) — selects which beat gets the long wait
+- Fixed: Arp Random (Mode=5) was unreachable due to a SetMode clamping bug
+- Chord Reference window now shows hex values for pattern entry
+
+### v1.0
+- Initial release: 51 chords, 6 arp modes, 16 voices, per-voice target routing
+
+---
+
 ## Architecture notes
 
 Pedal Chord is a **control machine** (`public void Work()` with no parameters).
@@ -114,8 +172,11 @@ resetting to zero. Notes and parameter changes are delivered by ReBuzz via
 
 Swing uses integer `ArpTicks` with rounded `longTicks`/`shortTicks` values that
 sum exactly to `2 × Speed`, ensuring tempo is locked at all swing amounts and
-speed values. `ArpStepParity` toggles strictly between 0 and 1 so alternation
-never drifts regardless of pattern length or loop count.
+speed values. `ArpStepParity` toggles strictly between 0 and 1.
+
+Velocity is delivered best-effort: the target's velocity/volume parameter is
+found by name ("Volume", "Velocity", "Vol", "Vel") or by position (parameter
+immediately after the note param in the same track group).
 
 `IBuzzMachine.Tick()` is **not called** for managed machines — all per-tick
 logic lives in `Work()`.

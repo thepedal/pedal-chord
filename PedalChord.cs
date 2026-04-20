@@ -139,12 +139,16 @@ namespace WDE.PedalChord
         public int Speed        = 2;
         public int Length       = 4;
         public int OctaveSpread = 1;
-        public int Swing       = 0;
+        public int Swing        = 0;
         public int SwingPhaseVal = 0;  // set by SetSwingPhase parameter
+        public int Velocity      = 100; // 1-127 MIDI velocity
+        public int Humanize      = 0;   // 0-100 timing randomisation
+        public int HumanizeVel   = 0;   // 0-100 velocity randomisation
 
         // Note trigger: set by SetNote, consumed by Work()
-        public int  PendingNote = 0;
-        public bool HasNewNote  = false;
+        public int  PendingNote  = 0;
+        public bool HasNewNote   = false;
+        public bool PendingReset = false; // set by Arp Reset param; consumed in Work()
 
         // Playback
         public bool  Active   = false;
@@ -243,6 +247,39 @@ namespace WDE.PedalChord
             if ((uint)track >= MaxVoices) return;
             _vs[track].PendingNote = value.Value;  // Note.Value is byte
             _vs[track].HasNewNote  = true;
+        }
+
+        [ParameterDecl(Name = "Velocity", MinValue = 1, MaxValue = 127, DefValue = 100,
+                       Description = "Note velocity sent to target (1-127)")]
+        public void SetVelocity(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            _vs[track].Velocity = Math.Max(1, Math.Min(127, value));
+        }
+
+        [ParameterDecl(Name = "Humanize", MinValue = 0, MaxValue = 100, DefValue = 0,
+                       Description = "Random ±timing drift per arp step (scales with Speed)")]
+        public void SetHumanize(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            _vs[track].Humanize = Math.Max(0, Math.Min(100, value));
+        }
+
+        [ParameterDecl(Name = "Hum. Vel", MinValue = 0, MaxValue = 100, DefValue = 0,
+                       Description = "Random ±velocity variation per arp step (scales with Velocity)")]
+        public void SetHumanizeVel(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            _vs[track].HumanizeVel = Math.Max(0, Math.Min(100, value));
+        }
+
+        [ParameterDecl(Name = "Arp Reset", MinValue = 0, MaxValue = 1, DefValue = 0,
+                       IsStateless = true,
+                       Description = "1 = restart arp from first note on this step")]
+        public void SetArpReset(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            if (value != 0) _vs[track].PendingReset = true;
         }
 
         [ParameterDecl(
@@ -440,6 +477,32 @@ namespace WDE.PedalChord
             return null;
         }
 
+        // Find a velocity/volume track parameter on the target machine.
+        // Searches the same track group as FindNoteParam, looking for the
+        // parameter immediately after the note param, or one named "Volume"
+        // / "Velocity" / "Vol" / "Vel" (case-insensitive). Returns null if
+        // none found — velocity delivery is best-effort.
+        IParameter FindVelocityParam(IMachine m, IParameter noteParam)
+        {
+            if (m == null || m.ParameterGroups == null) return null;
+            var velNames = new[] { "volume", "velocity", "vol", "vel" };
+            foreach (var pg in m.ParameterGroups)
+            {
+                if (pg?.Parameters == null || pg.Parameters.Count < 2) continue;
+                // Check names first
+                foreach (var p in pg.Parameters)
+                {
+                    if (p == null || p == noteParam) continue;
+                    if (velNames.Contains(p.Name?.ToLowerInvariant() ?? "")) return p;
+                }
+                // Fall back: parameter immediately after the note param in the same group
+                int ni = pg.Parameters.IndexOf(noteParam);
+                if (ni >= 0 && ni + 1 < pg.Parameters.Count)
+                    return pg.Parameters[ni + 1];
+            }
+            return null;
+        }
+
         void EnsureTrackCount(IMachine m, int needed)
         {
             // In ReBuzz IMachine.TrackCount may or may not have a setter on the
@@ -465,10 +528,15 @@ namespace WDE.PedalChord
             }
         }
 
-        void FireNote(IParameter np, IMachine m, int track, int midiNote)
+        void FireNote(IParameter np, IMachine m, int track, int midiNote,
+                      IParameter vp = null, int velocity = 100)
         {
             if (np == null || m == null || track < 0) return;
             EnsureTrackCount(m, track + 1);
+            // Set velocity before the note so the machine sees both in the same tick.
+            if (vp != null)
+                try { vp.SetValue(track, Math.Max(vp.MinValue,
+                                             Math.Min(vp.MaxValue, velocity))); } catch { }
             try { np.SetValue(track, BN.FromMidi(midiNote)); } catch { return; }
             // SendControlChanges tells the target's TickAndWork() to run an
             // extra AudioTick() before Work(), picking up the pvalue we just wrote.
@@ -504,7 +572,7 @@ namespace WDE.PedalChord
             vs.Active = false;
         }
 
-        void Start(VoiceState vs, IParameter np, IMachine m, int baseTrack)
+        void Start(VoiceState vs, IParameter np, IParameter vp, IMachine m, int baseTrack)
         {
             Kill(vs, np, m);
             if (vs.Notes.Length == 0) return;
@@ -520,37 +588,46 @@ namespace WDE.PedalChord
                 for (int i = 0; i < vs.Notes.Length && i < MaxSlots; i++)
                 {
                     int t = baseTrack + i;
-                    FireNote(np, m, t, vs.Notes[i]);
+                    FireNote(np, m, t, vs.Notes[i], vp, vs.Velocity);
                     vs.SlotTrack[i] = t;
                     vs.SlotOff[i]   = vs.Length;
                 }
             }
             else
             {
-                StepArp(vs, np, m, baseTrack);
+                StepArp(vs, np, vp, m, baseTrack);
             }
         }
 
-        void StepArp(VoiceState vs, IParameter np, IMachine m, int baseTrack)
+        void StepArp(VoiceState vs, IParameter np, IParameter vp, IMachine m, int baseTrack)
         {
             if (vs.Notes.Length == 0) return;
             int idx = (vs.Mode == 5) ? _rng.Next(vs.Notes.Length) : vs.ArpIdx;
-            FireNote(np, m, baseTrack, vs.Notes[idx]);
+            int _velDrift = vs.HumanizeVel > 0
+                ? (int)Math.Round(vs.Velocity * vs.HumanizeVel / 200.0)
+                : 0;
+            int _velJitter  = _velDrift > 0 ? _rng.Next(-_velDrift, _velDrift + 1) : 0;
+            int _firedVel   = Math.Max(1, Math.Min(127, vs.Velocity + _velJitter));
+            FireNote(np, m, baseTrack, vs.Notes[idx], vp, _firedVel);
             vs.SlotTrack[0] = baseTrack;
             vs.SlotOff[0]   = vs.Length;
             if (vs.Mode != 5) AdvArp(vs);
             // Swing: compute integer long/short tick counts using Math.Round so
             // long + short = 2×Speed exactly — tempo is always locked.
-            // Swing=0 → long=short=Speed (straight).
-            // Swing=100 → long:short ≈ 2:1 (triplet shuffle).
-            // ArpStepParity is kept as 0 or 1 to avoid ever-growing int.
             float _ratio    = 1f + vs.Swing / 100f;   // [1.0 .. 2.0]
             int   _longT    = (int)Math.Round(2.0 * vs.Speed * _ratio / (_ratio + 1.0));
             int   _shortT   = Math.Max(1, 2 * vs.Speed - _longT);
             _longT          = Math.Max(1, 2 * vs.Speed - _shortT);
             bool  _isLong   = ((vs.ArpStepParity + vs.SwingPhaseVal) % 2 == 0);
-            vs.ArpTicks      = _isLong ? _longT : _shortT;
+            int   _base     = _isLong ? _longT : _shortT;
             vs.ArpStepParity = 1 - vs.ArpStepParity;   // toggle 0↔1 — never grows
+            // Humanize: random ±drift proportional to Speed, non-cumulative.
+            // Drift range = ±(Speed × Humanize / 200), minimum ±0.
+            int _drift = vs.Humanize > 0
+                ? (int)Math.Round(vs.Speed * vs.Humanize / 200.0)
+                : 0;
+            int _jitter = _drift > 0 ? _rng.Next(-_drift, _drift + 1) : 0;
+            vs.ArpTicks = Math.Max(1, _base + _jitter);
         }
 
         void AdvArp(VoiceState vs)
@@ -601,6 +678,7 @@ namespace WDE.PedalChord
                 TrackTarget cfg     = _state.Get(v);
                 IMachine    tgt     = ResolveTarget(v);
                 IParameter  np      = (tgt != null) ? FindNoteParam(tgt) : null;
+                IParameter  vp      = (np  != null) ? FindVelocityParam(tgt, np) : null;
                 int         baseTrk = cfg.BaseTrack;
 
                 // Note delivery from pattern — only arrives on the first Work()
@@ -617,10 +695,20 @@ namespace WDE.PedalChord
                     {
                         vs.Notes = BuildNotes(vs.PendingNote, vs.ChordType, vs.OctaveSpread);
                         if (tgt != null && np != null)
-                            Start(vs, np, tgt, baseTrk);
+                            Start(vs, np, vp, tgt, baseTrk);
                     }
                     continue;
                 }
+
+                // Arp reset — rewind note sequence to start, fires on next tick.
+                if (vs.PendingReset && newTick && vs.Active)
+                {
+                    vs.PendingReset = false;
+                    vs.ArpIdx = (vs.Mode == 2 || vs.Mode == 4) ? vs.Notes.Length - 1 : 0;
+                    vs.ArpDir = (vs.Mode == 4) ? -1 : 1;
+                    vs.ArpTicks = 1; // fire from new position on the very next tick
+                }
+                else vs.PendingReset = false; // clear if voice not active
 
                 if (!vs.Active || tgt == null || np == null) continue;
 
@@ -640,7 +728,7 @@ namespace WDE.PedalChord
                 // Countdown fires when ArpTicks reaches 0; StepArp sets the
                 // next value using rounded integer long/short alternation.
                 if (vs.Mode != 0 && vs.ArpTicks > 0 && --vs.ArpTicks == 0)
-                    StepArp(vs, np, tgt, baseTrk);
+                    StepArp(vs, np, vp, tgt, baseTrk);
             }
         }
 
@@ -673,8 +761,9 @@ namespace WDE.PedalChord
 
                 // Reset voice — no pending or active state survives a Stop.
                 vs.Active      = false;
-                vs.HasNewNote  = false;
-                vs.PendingNote = 0;
+                vs.HasNewNote   = false;
+                vs.PendingNote  = 0;
+                vs.PendingReset = false;
                 vs.ArpTicks      = 0;
                 vs.ArpStepParity = 0;
                 for (int s = 0; s < MaxSlots; s++) vs.SlotOff[s] = 0;
