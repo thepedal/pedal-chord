@@ -139,6 +139,8 @@ namespace WDE.PedalChord
         public int Speed        = 2;
         public int Length       = 4;
         public int OctaveSpread = 1;
+        public int Swing       = 0;
+        public int SwingPhaseVal = 0;  // set by SetSwingPhase parameter
 
         // Note trigger: set by SetNote, consumed by Work()
         public int  PendingNote = 0;
@@ -149,7 +151,8 @@ namespace WDE.PedalChord
         public int[] Notes    = new int[0]; // expanded MIDI note numbers
         public int   ArpIdx   = 0;
         public int   ArpDir   = 1;          // +1 or -1 (ping-pong direction)
-        public int   ArpTicks = 0;
+        public int ArpTicks       = 0;   // countdown to next arp step
+        public int ArpStepParity  = 0;   // kept in range [0,1] — even=long, odd=short
 
         // Active note slots (chord uses up to 5; arpeggio uses slot 0 only)
         public int[] SlotOff   = new int[16]; // ticks until note-off (0 = idle)
@@ -202,7 +205,7 @@ namespace WDE.PedalChord
         IBuzzMachineHost     host;
         PedalChordState      _state = new PedalChordState();
         VoiceState[]         _vs    = new VoiceState[MaxVoices];
-        int                  _prevPosInTick = int.MaxValue; // tick-boundary detection
+        int                  _prevPit = int.MaxValue; // tick-boundary detection (like v1.0)
         Random               _rng   = new Random();
         TargetSettingsWindow _settingsWin = null;
 
@@ -297,7 +300,7 @@ namespace WDE.PedalChord
         public void SetMode(int value, int track)
         {
             if ((uint)track >= MaxVoices) return;
-            _vs[track].Mode = Math.Max(0, Math.Min(4, value));
+            _vs[track].Mode = Math.Max(0, Math.Min(5, value));
         }
 
         [ParameterDecl(
@@ -332,6 +335,22 @@ namespace WDE.PedalChord
         {
             if ((uint)track >= MaxVoices) return;
             _vs[track].OctaveSpread = Math.Max(1, Math.Min(4, value));
+        }
+
+        [ParameterDecl(Name = "Swing", MinValue = 0, MaxValue = 100, DefValue = 0,
+                       Description = "0 = straight  |  50 = medium shuffle  |  100 = 2:1 triplet swing")]
+        public void SetSwing(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            _vs[track].Swing = Math.Max(0, Math.Min(100, value));
+        }
+
+        [ParameterDecl(Name = "Swing On", MinValue = 0, MaxValue = 1, DefValue = 0,
+                       Description = "0 = swing on 1st beat  |  1 = swing on 2nd beat")]
+        public void SetSwingPhase(int value, int track)
+        {
+            if ((uint)track >= MaxVoices) return;
+            _vs[track].SwingPhaseVal = value & 1;
         }
 
         // =====================================================================
@@ -493,7 +512,8 @@ namespace WDE.PedalChord
             vs.Active   = true;
             vs.ArpIdx   = (vs.Mode == 2 || vs.Mode == 5) ? vs.Notes.Length - 1 : 0;
             vs.ArpDir   = (vs.Mode == 5) ? -1 : 1;
-            vs.ArpTicks = 0;
+            vs.ArpTicks      = 0;
+            vs.ArpStepParity = 0;
 
             if (vs.Mode == 0)   // Chord: all notes simultaneously
             {
@@ -519,7 +539,18 @@ namespace WDE.PedalChord
             vs.SlotTrack[0] = baseTrack;
             vs.SlotOff[0]   = vs.Length;
             if (vs.Mode != 5) AdvArp(vs);
-            vs.ArpTicks = vs.Speed;
+            // Swing: compute integer long/short tick counts using Math.Round so
+            // long + short = 2×Speed exactly — tempo is always locked.
+            // Swing=0 → long=short=Speed (straight).
+            // Swing=100 → long:short ≈ 2:1 (triplet shuffle).
+            // ArpStepParity is kept as 0 or 1 to avoid ever-growing int.
+            float _ratio    = 1f + vs.Swing / 100f;   // [1.0 .. 2.0]
+            int   _longT    = (int)Math.Round(2.0 * vs.Speed * _ratio / (_ratio + 1.0));
+            int   _shortT   = Math.Max(1, 2 * vs.Speed - _longT);
+            _longT          = Math.Max(1, 2 * vs.Speed - _shortT);
+            bool  _isLong   = ((vs.ArpStepParity + vs.SwingPhaseVal) % 2 == 0);
+            vs.ArpTicks      = _isLong ? _longT : _shortT;
+            vs.ArpStepParity = 1 - vs.ArpStepParity;   // toggle 0↔1 — never grows
         }
 
         void AdvArp(VoiceState vs)
@@ -558,10 +589,11 @@ namespace WDE.PedalChord
             if (Buzz == null) return;
 
             // Work() is called once per audio buffer (many times per pattern tick).
-            // Detect the first call in each new pattern tick by watching PosInTick reset.
-            int pit = host?.MasterInfo?.PosInTick ?? 0;
-            bool newTick = pit < _prevPosInTick;   // resets to 0 at each tick boundary
-            _prevPosInTick = pit;
+            // PosInTick resets to 0 at each tick boundary; we use that to fire timing
+            // logic exactly once per pattern tick (safe for SendControlChanges).
+            int  pit     = host?.MasterInfo?.PosInTick ?? 0;
+            bool newTick = pit < _prevPit;
+            _prevPit     = pit;
 
             for (int v = 0; v < MaxVoices; v++)
             {
@@ -592,8 +624,9 @@ namespace WDE.PedalChord
 
                 if (!vs.Active || tgt == null || np == null) continue;
 
-                // All timing (note-off and arp step) advances by one tick —
-                // only on the first Work() call of each pattern tick.
+                // All timing advances once per pattern tick — inside newTick so that
+                // FireNote/SendControlChanges are always called at a tick boundary,
+                // which is what the ReBuzz audio engine expects.
                 if (!newTick) continue;
 
                 // Note-off countdowns
@@ -603,7 +636,9 @@ namespace WDE.PedalChord
                     if (--vs.SlotOff[s] == 0) FireOff(np, tgt, vs.SlotTrack[s]);
                 }
 
-                // Arpeggio step
+                // Arpeggio step — fractional-tick swing accumulator.
+                // Countdown fires when ArpTicks reaches 0; StepArp sets the
+                // next value using rounded integer long/short alternation.
                 if (vs.Mode != 0 && vs.ArpTicks > 0 && --vs.ArpTicks == 0)
                     StepArp(vs, np, tgt, baseTrk);
             }
@@ -640,7 +675,8 @@ namespace WDE.PedalChord
                 vs.Active      = false;
                 vs.HasNewNote  = false;
                 vs.PendingNote = 0;
-                vs.ArpTicks    = 0;
+                vs.ArpTicks      = 0;
+                vs.ArpStepParity = 0;
                 for (int s = 0; s < MaxSlots; s++) vs.SlotOff[s] = 0;
             }
         }
