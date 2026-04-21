@@ -213,9 +213,10 @@ namespace WDE.PedalChord
         IBuzzMachineHost     host;
         PedalChordState      _state = new PedalChordState();
         VoiceState[]         _vs    = new VoiceState[MaxVoices];
-        int                  _prevPit = int.MaxValue; // tick-boundary detection (like v1.0)
+        int                  _prevPit      = int.MaxValue; // tick-boundary detection (like v1.0)
         Random               _rng   = new Random();
         TargetSettingsWindow _settingsWin = null;
+        IParameter           _ownNoteParam = null;  // our own Note param, for multi-track workaround
 
         // ── Constructor ───────────────────────────────────────────────────────
         public PedalChordMachine(IBuzzMachineHost host)
@@ -223,8 +224,32 @@ namespace WDE.PedalChord
             this.host = host;
             for (int i = 0; i < MaxVoices; i++)
                 _vs[i] = new VoiceState();
+        }
 
+        // Cache of the pvalues Dictionary<int,int> from our own Note ParameterCore.
+        // Populated lazily on first SetNote call (after ParameterGroups exist).
+        // Dictionary.TryGetValue is allocation-free — safe on the audio thread.
+        System.Collections.Concurrent.ConcurrentDictionary<int,int> _ownNotePValues = null;
 
+        void TryInitPValues()
+        {
+            try
+            {
+                if (_ownNoteParam == null)
+                {
+                    var pg = host?.Machine?.ParameterGroups;
+                    if (pg == null || pg.Count < 3) return;
+                    _ownNoteParam = pg[2].Parameters.FirstOrDefault(
+                        p => p?.Type == ParameterType.Note);
+                }
+                if (_ownNoteParam == null || _ownNotePValues != null) return;
+                var fi = _ownNoteParam.GetType().GetField("pvalues",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (fi != null)
+                    _ownNotePValues = fi.GetValue(_ownNoteParam)
+                        as System.Collections.Concurrent.ConcurrentDictionary<int,int>;
+            }
+            catch { }
         }
 
         // ── IBuzzMachine host property ────────────────────────────────────────
@@ -251,6 +276,28 @@ namespace WDE.PedalChord
             if ((uint)track >= MaxVoices) return;
             _vs[track].PendingNote = value.Value;  // Note.Value is byte
             _vs[track].HasNewNote  = true;
+
+            // ReBuzz workaround: machine.parametersChanged is Dictionary<IParameter,int>
+            // so simultaneous notes on multiple tracks overwrite each other — only the
+            // last track's SetNote is called. Poll other tracks' pvalues here while
+            // they are still valid (before the post-Tick pvalue reset).
+            // Poll other tracks' fresh note values to work around the ReBuzz
+            // parametersChanged dict only storing one track per IParameter.
+            if (_ownNotePValues == null) TryInitPValues();
+            if (_ownNotePValues != null)
+            {
+                int noVal = _ownNoteParam.NoValue;
+                for (int t = 0; t < MaxVoices; t++)
+                {
+                    if (t == track) continue;
+                    int pv;
+                    if (_ownNotePValues.TryGetValue(t, out pv) && pv != noVal)
+                    {
+                        _vs[t].PendingNote = (byte)pv;
+                        _vs[t].HasNewNote  = true;
+                    }
+                }
+            }
         }
 
         [ParameterDecl(Name = "Velocity", MinValue = 1, MaxValue = 127, DefValue = 100,
@@ -358,13 +405,14 @@ namespace WDE.PedalChord
 
         [ParameterDecl(
             Name        = "Length",
-            MaxValue    = 64,
+            MinValue    = 0,
+            MaxValue    = 16384,
             DefValue    = 4,
-            Description = "Note duration in ticks before auto note-off (1-64)")]
+            Description = "Note duration in ticks (0 = no auto note-off, let target decide)")]
         public void SetLength(int value, int track)
         {
             if ((uint)track >= MaxVoices) return;
-            _vs[track].Length = Math.Max(1, value);
+            _vs[track].Length = Math.Max(0, value);
         }
 
         [ParameterDecl(
@@ -498,30 +546,23 @@ namespace WDE.PedalChord
             return null;
         }
 
-        // Find a velocity/volume track parameter on the target machine.
-        // Searches the same track group as FindNoteParam, looking for the
-        // parameter immediately after the note param, or one named "Volume"
-        // / "Velocity" / "Vol" / "Vel" (case-insensitive). Returns null if
-        // none found — velocity delivery is best-effort.
+        // Find a velocity/volume parameter on the target machine by name.
+        // Looks for "Volume", "Velocity", "Vol", or "Vel" (case-insensitive).
+        // Returns null if none found — velocity delivery is best-effort.
         IParameter FindVelocityParam(IMachine m, IParameter noteParam)
         {
             if (m == null || m.ParameterGroups == null) return null;
             var velNames = new[] { "volume", "velocity", "vol", "vel" };
             foreach (var pg in m.ParameterGroups)
             {
-                if (pg?.Parameters == null || pg.Parameters.Count < 2) continue;
-                // Check names first
+                if (pg?.Parameters == null) continue;
                 foreach (var p in pg.Parameters)
                 {
                     if (p == null || p == noteParam) continue;
                     if (velNames.Contains(p.Name?.ToLowerInvariant() ?? "")) return p;
                 }
-                // Fall back: parameter immediately after the note param in the same group
-                int ni = pg.Parameters.IndexOf(noteParam);
-                if (ni >= 0 && ni + 1 < pg.Parameters.Count)
-                    return pg.Parameters[ni + 1];
             }
-            return null;
+            return null; // no named velocity param found — skip velocity delivery
         }
 
         void EnsureTrackCount(IMachine m, int needed)
@@ -554,13 +595,10 @@ namespace WDE.PedalChord
         {
             if (np == null || m == null || track < 0) return;
             EnsureTrackCount(m, track + 1);
-            // Set velocity before the note so the machine sees both in the same tick.
             if (vp != null)
                 try { vp.SetValue(track, Math.Max(vp.MinValue,
                                              Math.Min(vp.MaxValue, velocity))); } catch { }
             try { np.SetValue(track, BN.FromMidi(midiNote)); } catch { return; }
-            // SendControlChanges tells the target's TickAndWork() to run an
-            // extra AudioTick() before Work(), picking up the pvalue we just wrote.
             try { m.SendControlChanges(); } catch { }
         }
 
@@ -613,7 +651,7 @@ namespace WDE.PedalChord
                     int t = baseTrack + i;
                     FireNote(np, m, t, vs.Notes[i], vp, vs.Velocity);
                     vs.SlotTrack[i] = t;
-                    vs.SlotOff[i]   = vs.Length;
+                    vs.SlotOff[i]   = vs.Length > 0 ? vs.Length : 0;
                 }
             }
             else
@@ -636,7 +674,7 @@ namespace WDE.PedalChord
                 _midiNote = Math.Min(119, _midiNote + vs.OctOffset * 12);
             FireNote(np, m, baseTrack, _midiNote, vp, _firedVel);
             vs.SlotTrack[0] = baseTrack;
-            vs.SlotOff[0]   = vs.Length;
+            vs.SlotOff[0]   = vs.Length > 0 ? vs.Length : 0;
             if (vs.Mode != 5) AdvArp(vs);
             // Swing: compute integer long/short tick counts using Math.Round so
             // long + short = 2×Speed exactly — tempo is always locked.
@@ -771,11 +809,10 @@ namespace WDE.PedalChord
                     }
                     else if (vs.PendingNote > 0)
                     {
-                        // OctWalk manages octaves at runtime; build base notes only.
                         int _octs = vs.OctWalk != 0 ? 1 : vs.OctaveSpread;
                         vs.Notes = BuildNotes(vs.PendingNote, vs.ChordType, _octs);
                         if (tgt != null && np != null)
-                            Start(vs, np, vp, tgt, baseTrk);
+                        Start(vs, np, vp, tgt, baseTrk);
                     }
                     continue;
                 }
@@ -786,29 +823,24 @@ namespace WDE.PedalChord
                     vs.PendingReset = false;
                     vs.ArpIdx = (vs.Mode == 2 || vs.Mode == 4) ? vs.Notes.Length - 1 : 0;
                     vs.ArpDir = (vs.Mode == 4) ? -1 : 1;
-                    vs.ArpTicks = 1; // fire from new position on the very next tick
+                    vs.ArpTicks = 1;
                 }
-                else vs.PendingReset = false; // clear if voice not active
+                else vs.PendingReset = false;
 
                 if (!vs.Active || tgt == null || np == null) continue;
-
-                // All timing advances once per pattern tick — inside newTick so that
-                // FireNote/SendControlChanges are always called at a tick boundary,
-                // which is what the ReBuzz audio engine expects.
                 if (!newTick) continue;
 
                 // Note-off countdowns
                 for (int s = 0; s < MaxSlots; s++)
                 {
                     if (vs.SlotOff[s] <= 0) continue;
-                    if (--vs.SlotOff[s] == 0) FireOff(np, tgt, vs.SlotTrack[s]);
+                    if (--vs.SlotOff[s] == 0)
+                    FireOff(np, tgt, vs.SlotTrack[s]);
                 }
 
-                // Arpeggio step — fractional-tick swing accumulator.
-                // Countdown fires when ArpTicks reaches 0; StepArp sets the
-                // next value using rounded integer long/short alternation.
+                // Arpeggio step
                 if (vs.Mode != 0 && vs.ArpTicks > 0 && --vs.ArpTicks == 0)
-                    StepArp(vs, np, vp, tgt, baseTrk);
+                StepArp(vs, np, vp, tgt, baseTrk);
             }
         }
 
@@ -821,7 +853,7 @@ namespace WDE.PedalChord
         // voice state so Work() fires nothing until the next Play.
         public void Stop()
         {
-            for (int v = 0; v < MaxVoices; v++)
+for (int v = 0; v < MaxVoices; v++)
             {
                 VoiceState vs  = _vs[v];
                 IMachine   tgt = ResolveTarget(v);
@@ -830,20 +862,15 @@ namespace WDE.PedalChord
                 if (vs.Active && np != null && tgt != null)
                 {
                     for (int s = 0; s < MaxSlots; s++)
-                    {
                         if (vs.SlotOff[s] > 0)
-                        {
                             try { np.SetValue(vs.SlotTrack[s], BN.Off); } catch { }
-                        }
-                    }
                     try { tgt.SendControlChanges(); } catch { }
                 }
 
-                // Reset voice — no pending or active state survives a Stop.
-                vs.Active      = false;
-                vs.HasNewNote   = false;
-                vs.PendingNote  = 0;
-                vs.PendingReset = false;
+                vs.Active        = false;
+                vs.HasNewNote    = false;
+                vs.PendingNote   = 0;
+                vs.PendingReset  = false;
                 vs.ArpTicks      = 0;
                 vs.ArpStepParity = 0;
                 vs.OctOffset     = 0;
@@ -851,6 +878,7 @@ namespace WDE.PedalChord
                 for (int s = 0; s < MaxSlots; s++) vs.SlotOff[s] = 0;
             }
         }
+
 
         // =====================================================================
         // Machine state persistence
@@ -884,9 +912,10 @@ namespace WDE.PedalChord
         {
             switch (id)
             {
-                case 0: OpenSettings(); break;
-                case 1: ShowAbout();    break;
+                case 0: OpenSettings();  break;
+                case 1: ShowAbout();     break;
                 case 2: ShowChordRef();  break;
+                case 3: ShowDiagnostics(); break;
             }
         }
 
@@ -894,7 +923,8 @@ namespace WDE.PedalChord
         {
             new MenuEntry(0, "Target Settings\u2026", OpenSettings),
             new MenuEntry(1, "About\u2026",           ShowAbout),
-            new MenuEntry(2, "Chord Reference…", ShowChordRef),
+            new MenuEntry(2, "Chord Reference\u2026", ShowChordRef),
+            new MenuEntry(3, "Diagnostics\u2026",     ShowDiagnostics),
         };
 
         void OpenSettings()
@@ -989,6 +1019,46 @@ namespace WDE.PedalChord
                     win.Show();
                 }
                 catch { }
+            }));
+        }
+
+        void ShowDiagnostics()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("Voice routing diagnostics:");
+            sb.AppendLine("");
+            for (int v = 0; v < MaxVoices; v++)
+            {
+                string name = _state.Get(v).MachineName;
+                if (string.IsNullOrEmpty(name)) continue;  // skip unconfigured
+                IMachine   tgt = ResolveTarget(v);
+                IParameter np  = tgt != null ? FindNoteParam(tgt) : null;
+                int _tc = tgt?.TrackCount ?? -1;
+                sb.AppendFormat("Voice {0}: target=[{1}]  resolved={2}  noteParam={3} (hash={4})  tracks={5}  active={6}\n",
+                    v + 1, name,
+                    tgt != null ? "YES" : "NO - name not found in Song",
+                    np  != null ? "YES" : "NO - param not found",
+                    np  != null ? np.GetHashCode().ToString() : "n/a",
+                    _tc,
+                    _vs[v].Active);
+            }
+            if (sb.Length == 0 || !sb.ToString().Contains("Voice"))
+                sb.AppendLine("  (no voices configured - open Target Settings first)");
+            string diagMsg = sb.ToString();
+            // Write to ReBuzz debug console (View → Debug Console or Ctrl+D)
+            try
+            {
+                IBuzz buzz = Buzz;
+                if (buzz != null)
+                    foreach (string line in diagMsg.Split('\n'))
+                        if (line.Trim().Length > 0)
+                            buzz.DCWriteLine("[PedalChord] " + line.Trim());
+            }
+            catch { }
+            // Also open the debug console so the user can see it
+            Application.Current?.Dispatcher?.BeginInvoke((Action)(() =>
+            {
+                try { Buzz?.ExecuteCommand(BuzzCommand.DebugConsole); } catch { }
             }));
         }
 
