@@ -1,4 +1,4 @@
-# Pedal Chord v1.3 — ReBuzz Managed Controller Machine
+# Pedal Chord v1.4 — ReBuzz Managed Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note into Pedal Chord's
 pattern and it fires the full chord (or arpeggiated notes) on any target
@@ -139,7 +139,7 @@ Output: `<BuzzDir>\Gear\Generators\Pedal Chord.NET.dll`
 
 ## Changelog
 
-### v1.3
+### v1.4
 - **Step** (1–8) — advance N chord tones per arp step
 - **Oct Walk** (Off/Up/Ping-pong) — independent octave cycling
 - **Multi-voice simultaneous trigger fix** — up to 16 voices can now all fire
