@@ -208,10 +208,23 @@ namespace WDE.PedalChord
     public class PedalChordMachine : IBuzzMachine
     {
         const int MaxVoices = 16;
+        // Cached per-voice resolution of target machine + parameters.
+        struct VoiceCache
+        {
+            public IMachine    Machine;
+            public IParameter  NoteParam;
+            public IParameter  VelParam;
+            public string      MachineName;
+            public int         BaseTrack;
+            public bool        Valid;
+        }
+
         const int MaxSlots  = 16;  // max simultaneous notes (Dom13 Full = 7; 16 covers 2 octaves of any chord)
 
         IBuzzMachineHost     host;
         PedalChordState      _state = new PedalChordState();
+        VoiceCache[]         _cache = new VoiceCache[16];
+        int                  _cacheTickCount = 0;
         VoiceState[]         _vs    = new VoiceState[MaxVoices];
         int                  _prevPit      = int.MaxValue; // tick-boundary detection (like v1.0)
         Random               _rng   = new Random();
@@ -260,6 +273,37 @@ namespace WDE.PedalChord
         }
 
         IBuzz Buzz => host?.Machine?.Graph?.Buzz;
+
+        // ── Voice cache — avoids per-Work() LINQ searches ────────────────────────
+        void InvalidateCache()
+        {
+            for (int i = 0; i < _cache.Length; i++) _cache[i].Valid = false;
+        }
+
+        void EnsureCache(int v)
+        {
+            TrackTarget cfg = _state.Get(v);
+            if (_cache[v].Valid &&
+                _cache[v].MachineName == cfg.MachineName &&
+                _cache[v].BaseTrack   == cfg.BaseTrack) return;
+            _cache[v].MachineName = cfg.MachineName;
+            _cache[v].BaseTrack   = cfg.BaseTrack;
+            _cache[v].Machine     = null;
+            _cache[v].NoteParam   = null;
+            _cache[v].VelParam    = null;
+            _cache[v].Valid       = true;
+            if (string.IsNullOrEmpty(cfg.MachineName)) return;
+            try
+            {
+                _cache[v].Machine   = Buzz?.Song?.Machines?.FirstOrDefault(
+                    m => m.Name == cfg.MachineName);
+                _cache[v].NoteParam = _cache[v].Machine != null
+                    ? FindNoteParam(_cache[v].Machine) : null;
+                _cache[v].VelParam  = _cache[v].NoteParam != null
+                    ? FindVelocityParam(_cache[v].Machine, _cache[v].NoteParam) : null;
+            }
+            catch { }
+        }
 
         // =====================================================================
         // Track parameters
@@ -463,21 +507,27 @@ namespace WDE.PedalChord
         // Chord building
         // =====================================================================
 
+        static readonly int[] _buildBuf = new int[128]; // scratch buffer, max chord×octaves
         int[] BuildNotes(int buzzRoot, int chordType, int octaves)
         {
             int root = BN.ToMidi(buzzRoot);
-            if (root < 0) return new int[0];
+            if (root < 0) return Array.Empty<int>();
 
-            var ivals = ChordLib.Intervals[Math.Max(0, Math.Min(ChordLib.Intervals.Length - 1, chordType))];
-            var list  = new List<int>();
+            int[] ivals = ChordLib.Intervals[
+                Math.Max(0, Math.Min(ChordLib.Intervals.Length - 1, chordType))];
+            int count = 0;
             for (int o = 0; o < octaves; o++)
                 foreach (int s in ivals)
-                    list.Add(root + s + o * 12);
-
-            return list
-                .Select(n => Math.Max(0, Math.Min(119, n)))
-                .Distinct()
-                .ToArray();
+                {
+                    int n = Math.Max(0, Math.Min(119, root + s + o * 12));
+                    // Deduplicate inline (ivals are ordered; duplicates only arise at octave boundaries)
+                    bool dup = false;
+                    for (int i = 0; i < count; i++) if (_buildBuf[i] == n) { dup = true; break; }
+                    if (!dup && count < _buildBuf.Length) _buildBuf[count++] = n;
+                }
+            int[] result = new int[count];
+            Array.Copy(_buildBuf, result, count);
+            return result;
         }
 
         // =====================================================================
@@ -787,15 +837,18 @@ namespace WDE.PedalChord
             int  pit     = host?.MasterInfo?.PosInTick ?? 0;
             bool newTick = pit < _prevPit;
             _prevPit     = pit;
+            // Re-validate cache once every 100 ticks in case a machine was
+            // renamed or deleted while playing. Very cheap — just resets Valid flags.
+            if (newTick) { _cacheTickCount++; if (_cacheTickCount >= 100) { InvalidateCache(); _cacheTickCount = 0; } }
 
             for (int v = 0; v < MaxVoices; v++)
             {
                 VoiceState  vs      = _vs[v];
-                TrackTarget cfg     = _state.Get(v);
-                IMachine    tgt     = ResolveTarget(v);
-                IParameter  np      = (tgt != null) ? FindNoteParam(tgt) : null;
-                IParameter  vp      = (np  != null) ? FindVelocityParam(tgt, np) : null;
-                int         baseTrk = cfg.BaseTrack;
+                EnsureCache(v);
+                IMachine    tgt     = _cache[v].Machine;
+                IParameter  np      = _cache[v].NoteParam;
+                IParameter  vp      = _cache[v].VelParam;
+                int         baseTrk = _cache[v].BaseTrack;
 
                 // Note delivery from pattern — only arrives on the first Work()
                 // call of a tick (set by managedMachineHost.Tick() beforehand).
@@ -887,7 +940,7 @@ for (int v = 0; v < MaxVoices; v++)
         public PedalChordState MachineState
         {
             get => _state;
-            set { if (value != null) _state = value; }
+            set { if (value != null) { _state = value; InvalidateCache(); } }
         }
 
         // =====================================================================
@@ -979,7 +1032,7 @@ for (int v = 0; v < MaxVoices; v++)
                     _settingsWin = win;
                     win.Closed  += (s2, e2) =>
                     {
-                        if (win.DialogResult == true) _state = win.Result;
+                        if (win.DialogResult == true) { _state = win.Result; InvalidateCache(); }
                         _settingsWin = null;
                     };
                     win.ShowDialog();
