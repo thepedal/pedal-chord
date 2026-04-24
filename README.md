@@ -1,4 +1,4 @@
-# Pedal Chord v1.7 — ReBuzz Managed Controller Machine
+# Pedal Chord v1.7 — ReBuzz Managed Generator Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note in the pattern and
 Pedal Chord fires the full chord (or arpeggiated notes) on any target generator
