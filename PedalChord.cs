@@ -182,37 +182,32 @@ namespace WDE.PedalChord
         VoiceState      _vs    = new VoiceState();
         Random          _rng   = new Random();
 
-        // Cached target resolution — refreshed when settings change or every 100 ticks
-        IMachine   _tgt     = null;
-        IParameter _np      = null;
-        IParameter _vp      = null;
-        bool       _cacheValid    = false;
-        int        _cacheTickCount = 0;
+        // Cached target resolution — only set on the UI thread (never from Work).
+        IMachine   _tgt = null;
+        IParameter _np  = null;
+        IParameter _vp  = null;
 
         int  _prevPit = int.MaxValue;
 
-        static readonly int[] _buildBuf = new int[128];
+        readonly int[] _buildBuf = new int[128]; // per-instance, never shared
 
         // ── Construction ──────────────────────────────────────────────────────
         public PedalChordMachine(IBuzzMachineHost host) { this.host = host; }
 
-        public IBuzzMachineHost Host { set { host = value; InvalidateCache(); } }
+        public IBuzzMachineHost Host { set { host = value; } }
 
-        // ── Cache ─────────────────────────────────────────────────────────────
-        void InvalidateCache() { _cacheValid = false; }
-
-        void EnsureCache()
+        // ── Cache — always resolved on the UI thread, never from Work() ─────────
+        void ResolveCache()
         {
-            if (_cacheValid) return;
-            _cacheValid = true;
             _tgt = null; _np = null; _vp = null;
-            if (string.IsNullOrEmpty(_state.TargetMachine)) return;
+            if (string.IsNullOrEmpty(_state.TargetMachine)) { return; }
             try
             {
                 _tgt = Buzz?.Song?.Machines?.FirstOrDefault(
                     m => m.Name == _state.TargetMachine);
-                _np  = _tgt != null ? FindNoteParam(_tgt) : null;
-                _vp  = _np  != null ? FindVelocityParam(_tgt, _np) : null;
+_np = _tgt != null ? FindNoteParam(_tgt) : null;
+_vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
+                if (_tgt != null) EnsureTrackCount(_tgt, VoiceState.MaxSlots);
             }
             catch { }
         }
@@ -352,7 +347,7 @@ namespace WDE.PedalChord
             try
             {
                 var prop = m.GetType().GetProperty("TrackCount");
-                if (prop?.CanWrite == true) prop.SetValue(m, needed);
+                if (prop?.CanWrite == true) { prop.SetValue(m, needed); }
             }
             catch { }
         }
@@ -360,7 +355,6 @@ namespace WDE.PedalChord
         void FireNote(int track, int midiNote, int velocity)
         {
             if (_np == null || _tgt == null || track < 0) return;
-            EnsureTrackCount(_tgt, track + 1);
             if (_vp != null)
                 try { _vp.SetValue(track, Math.Max(_vp.MinValue,
                                              Math.Min(_vp.MaxValue, velocity))); } catch { }
@@ -515,18 +509,11 @@ namespace WDE.PedalChord
         public void Work()
         {
             if (Buzz == null) return;
-
             int  pit     = host?.MasterInfo?.PosInTick ?? 0;
             bool newTick = pit < _prevPit;
             _prevPit     = pit;
 
-            if (newTick)
-            {
-                _cacheTickCount++;
-                if (_cacheTickCount >= 100) { InvalidateCache(); _cacheTickCount = 0; }
-            }
-
-            EnsureCache();
+            // _tgt/_np/_vp are resolved on the UI thread only — never touched here.
             int baseTrk = _state.BaseTrack;
 
             if (_vs.HasNewNote)
@@ -570,7 +557,6 @@ namespace WDE.PedalChord
 
         public void Stop()
         {
-            EnsureCache();
             if (_vs.Active && _np != null && _tgt != null)
             {
                 for (int s = 0; s < VoiceState.MaxSlots; s++)
@@ -594,7 +580,13 @@ namespace WDE.PedalChord
         public PedalChordState MachineState
         {
             get => _state;
-            set { if (value != null) { _state = value; InvalidateCache(); } }
+            set
+            {
+                if (value == null) return;
+                _state = value;
+                // Resolve on the UI thread; song load always happens there.
+                Application.Current?.Dispatcher?.BeginInvoke((Action)ResolveCache);
+            }
         }
 
         // ── Right-click commands ──────────────────────────────────────────────
@@ -623,21 +615,45 @@ namespace WDE.PedalChord
 
         void OpenSettings()
         {
-            var names = Buzz?.Song?.Machines?
-                .Where(m => m.Name != host?.Machine?.Name)
-                .Select(m => m.Name)
-                .OrderBy(n => n)
-                .ToList() ?? new List<string>();
-
-            Application.Current?.Dispatcher?.BeginInvoke((Action)(() =>
+            // Snapshot machine names on the calling thread (safe — still on UI thread
+            // since Command() is called by ReBuzz from the UI thread).
+            List<string> names;
+            try
             {
-                var win = new TargetSettingsWindow(_state, names);
-                if (win.ShowDialog() == true)
+                names = Buzz?.Song?.Machines?
+                    .Where(m => m.Name != host?.Machine?.Name)
+                    .Select(m => m.Name)
+                    .OrderBy(n => n)
+                    .ToList() ?? new List<string>();
+            }
+            catch { names = new List<string>(); }
+
+            PedalChordState stateSnap = _state;
+
+            // Open on a dedicated STA thread — completely independent of the
+            // ReBuzz dispatcher so ShowDialog() cannot affect the host pump.
+            var t = new System.Threading.Thread(() =>
+            {
+                try
                 {
-                    _state = win.Result;
-                    InvalidateCache();
+                    var win = new TargetSettingsWindow(stateSnap, names);
+                    bool ok = win.ShowDialog() == true;
+                    if (ok)
+                    {
+                        _state = win.Result;
+                        Application.Current?.Dispatcher?.BeginInvoke(
+                            (Action)ResolveCache);
+                    }
                 }
-            }));
+                catch (Exception ex)
+                {
+                    try { MessageBox.Show(ex.Message, "Pedal Chord – Settings Error",
+                        MessageBoxButton.OK, MessageBoxImage.Error); } catch { }
+                }
+            });
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
         }
 
         void ShowAbout()
@@ -656,7 +672,7 @@ namespace WDE.PedalChord
 
         void ShowDiagnostics()
         {
-            EnsureCache();
+            // Use cached values — no Song.Machines access here
             string msg = string.Format(
                 "Target=[{0}]  resolved={1}  noteParam={2} (hash={3})  tracks={4}  active={5}",
                 _state.TargetMachine,

@@ -1,4 +1,4 @@
-# Pedal Chord v1.7 — ReBuzz Managed Generator Controller Machine
+# Pedal Chord v1.5.1 — ReBuzz Managed Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note in the pattern and
 Pedal Chord fires the full chord (or arpeggiated notes) on any target generator
@@ -97,6 +97,13 @@ Output: `<BuzzDir>\Gear\Generators\Pedal Chord.NET.dll`
 ---
 
 ## Changelog
+
+### v1.5.1
+- Fixed: freeze/crash when using 6+ instances simultaneously. `EnsureTrackCount`
+  was being called from the audio thread on 64-bit native machines (e.g. Infector),
+  triggering cross-process IPC that deadlocked. Now runs only in `ResolveCache`
+  on the UI thread, pre-expanding track count at assignment time.
+- Fixed: `_buildBuf` scratch array made per-instance (was incorrectly `static`).
 
 ### v1.5
 - **Architecture simplified to single-voice/single-target** — one Pedal Chord
