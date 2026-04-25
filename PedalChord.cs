@@ -212,6 +212,28 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
             catch { }
         }
 
+        // Schedule ResolveCache with retries — on song load Song.Machines may
+        // not yet contain all machines when MachineState is first set.
+        void ScheduleResolve(int attempt = 0)
+        {
+            int delayMs = attempt == 0 ? 0 : Math.Min(500, 100 * attempt);
+            var timer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(delayMs)
+            };
+            timer.Tick += (s, e) =>
+            {
+                timer.Stop();
+                ResolveCache();
+                // If target still not found and we have a name to look for,
+                // retry up to 10 times (covers up to ~4 seconds of load time).
+                if (_tgt == null && !string.IsNullOrEmpty(_state.TargetMachine)
+                    && attempt < 10)
+                    ScheduleResolve(attempt + 1);
+            };
+            timer.Start();
+        }
+
         // ── Parameters ────────────────────────────────────────────────────────
 
         [ParameterDecl(IsStateless = true,
@@ -584,8 +606,9 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
             {
                 if (value == null) return;
                 _state = value;
-                // Resolve on the UI thread; song load always happens there.
-                Application.Current?.Dispatcher?.BeginInvoke((Action)ResolveCache);
+                // Song.Machines may not be fully populated when MachineState is
+                // set on load — schedule retries until the target resolves.
+                ScheduleResolve();
             }
         }
 
