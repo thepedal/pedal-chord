@@ -1,4 +1,4 @@
-# Pedal Chord v1.5.2 — ReBuzz Managed Controller Machine
+# Pedal Chord v1.5.4 — ReBuzz Managed Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note in the pattern and
 Pedal Chord fires the full chord (or arpeggiated notes) on any target generator
@@ -86,6 +86,7 @@ Arp mode fires on a single target track. Chord mode uses consecutive tracks
 ## Build from source
 
 Requirements: .NET 10 SDK, ReBuzz at `C:\Program Files\ReBuzz`.
+Built and tested against **ReBuzz 1827-preview**.
 
 ```powershell
 dotnet build PedalChord.csproj -c Release
@@ -97,6 +98,15 @@ Output: `<BuzzDir>\Gear\Generators\Pedal Chord.NET.dll`
 ---
 
 ## Changelog
+
+### v1.5.4
+- Rebuilt and retested against **ReBuzz 1827-preview**. No behavioural change.
+- Verified clean on 1827: tick-boundary detection (`MasterInfo.PosInTick`) is
+  unaffected by SubTickTiming — `PosInTick` stays tick-relative and resets only
+  at the tick boundary, so the arp still advances exactly once per tick.
+- Unaffected by the 1827 `pvalues` field-shape change (single-voice since v1.5,
+  no multi-track reflection poll) and by the MasterTap GUI-thread event change
+  (Pedal Chord doesn't hook MasterTap).
 
 ### v1.5.2
 - Fixed: target assignments not restored on song load. `Song.Machines` is not
