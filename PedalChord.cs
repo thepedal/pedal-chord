@@ -188,6 +188,8 @@ namespace WDE.PedalChord
         IParameter _vp  = null;
 
         int  _prevPit = int.MaxValue;
+        int  _prevSub = -1;          // last SubTickInfo.CurrentSubTick seen
+        int  _curR    = 1;           // step-clock divisor: sub-ticks/tick, or 1
 
         readonly int[] _buildBuf = new int[128]; // per-instance, never shared
 
@@ -466,16 +468,23 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
             _vs.SlotOff[0]   = _vs.Length > 0 ? _vs.Length : 0;
             if (_vs.Mode != 5) AdvArp();
 
+            // Countdown is measured in step units: sub-ticks when the host runs
+            // sub-tick timing (_curR = SubTicksPerTick), else whole ticks
+            // (_curR = 1). Scaling the period by R keeps average tempo locked
+            // (long + short == period exactly) while giving R× finer swing and
+            // humanize resolution — this is what lets swing work at low Speed.
+            int   R      = _curR < 1 ? 1 : _curR;
+            int   period = 2 * _vs.Speed * R;                  // long + short, step units
             float ratio  = 1f + _vs.Swing / 100f;
-            int   longT  = (int)Math.Round(2.0 * _vs.Speed * ratio / (ratio + 1.0));
-            int   shortT = Math.Max(1, 2 * _vs.Speed - longT);
-            longT        = Math.Max(1, 2 * _vs.Speed - shortT);
+            int   longT  = (int)Math.Round(period * ratio / (ratio + 1.0));
+            int   shortT = Math.Max(1, period - longT);
+            longT        = Math.Max(1, period - shortT);
             bool  isLong = ((_vs.ArpStepParity + _vs.SwingPhaseVal) % 2 == 0);
             int   baseT  = isLong ? longT : shortT;
             _vs.ArpStepParity = 1 - _vs.ArpStepParity;
 
             int drift  = _vs.Humanize > 0
-                ? (int)Math.Round(_vs.Speed * _vs.Humanize / 200.0) : 0;
+                ? (int)Math.Round(_vs.Speed * R * _vs.Humanize / 200.0) : 0;
             int jitter = drift > 0 ? _rng.Next(-drift, drift + 1) : 0;
             _vs.ArpTicks = Math.Max(1, baseT + jitter);
         }
@@ -531,9 +540,31 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
         public void Work()
         {
             if (Buzz == null) return;
+            var  sti     = host?.SubTickInfo;
             int  pit     = host?.MasterInfo?.PosInTick ?? 0;
             bool newTick = pit < _prevPit;
             _prevPit     = pit;
+
+            // Step clock. When the host runs sub-tick timing the arp advances on
+            // every sub-tick (R = SubTicksPerTick per tick) instead of every tick,
+            // giving R× finer swing/humanize placement. Sub-tick timing off →
+            // SubTicksPerTick is 0 → R = 1 → identical whole-tick behaviour.
+            // PosInTick only resets at the tick boundary, so newTick is still the
+            // tick clock; CurrentSubTick edges give the sub-tick clock.
+            int  R = (sti != null && sti.SubTicksPerTick > 1) ? sti.SubTicksPerTick : 1;
+            _curR  = R;
+            bool newStep;
+            if (R > 1)
+            {
+                int cs   = sti.CurrentSubTick;
+                newStep  = newTick || cs != _prevSub;   // tick wrap or new sub-tick
+                _prevSub = cs;
+            }
+            else
+            {
+                newStep  = newTick;
+                _prevSub = 0;
+            }
 
             // _tgt/_np/_vp are resolved on the UI thread only — never touched here.
             int baseTrk = _state.BaseTrack;
@@ -558,20 +589,22 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
                 _vs.PendingReset  = false;
                 _vs.ArpIdx        = (_vs.Mode == 2 || _vs.Mode == 4) ? _vs.Notes.Length - 1 : 0;
                 _vs.ArpDir        = (_vs.Mode == 4) ? -1 : 1;
-                _vs.ArpTicks      = 1;
+                _vs.ArpTicks      = 1;   // fire on the next step boundary
             }
             else _vs.PendingReset = false;
 
             if (!_vs.Active || _tgt == null || _np == null) return;
-            if (!newTick) return;
 
-            for (int s = 0; s < VoiceState.MaxSlots; s++)
-            {
-                if (_vs.SlotOff[s] <= 0) continue;
-                if (--_vs.SlotOff[s] == 0) FireOff(_vs.SlotTrack[s]);
-            }
+            // Note-offs run on the TICK clock — Length is specified in ticks.
+            if (newTick)
+                for (int s = 0; s < VoiceState.MaxSlots; s++)
+                {
+                    if (_vs.SlotOff[s] <= 0) continue;
+                    if (--_vs.SlotOff[s] == 0) FireOff(_vs.SlotTrack[s]);
+                }
 
-            if (_vs.Mode != 0 && _vs.ArpTicks > 0 && --_vs.ArpTicks == 0)
+            // Arp step runs on the STEP clock (sub-tick when active, else tick).
+            if (newStep && _vs.Mode != 0 && _vs.ArpTicks > 0 && --_vs.ArpTicks == 0)
                 StepArp(baseTrk);
         }
 

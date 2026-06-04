@@ -1,4 +1,4 @@
-# Pedal Chord v1.5.4 — ReBuzz Managed Controller Machine
+# Pedal Chord v1.5.5 — ReBuzz Managed Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note in the pattern and
 Pedal Chord fires the full chord (or arpeggiated notes) on any target generator
@@ -49,12 +49,20 @@ Speed is in **pattern ticks** (rows) — exact regardless of BPM or buffer size.
 
 ## Swing
 
-Long and short waits alternate, summing to exactly `2 × Speed`:
+Long and short waits alternate, summing to exactly `2 × Speed` per pair, so
+average tempo is locked at all swing values:
 ```
-longTicks  = Round(2 × Speed × ratio / (ratio + 1))
-shortTicks = 2 × Speed − longTicks
+period     = 2 × Speed × R          (R = sub-ticks per tick, or 1)
+longUnits  = Round(period × ratio / (ratio + 1))
+shortUnits = period − longUnits
 ```
-Average tempo is locked at all swing values.
+
+When ReBuzz's **Sub-Tick Timing** is enabled (engine settings), the arp advances
+on each sub-tick rather than each tick, so swing is placed at `R×` finer
+resolution — meaningful swing now works even at low **Speed** (e.g. Speed 2),
+which previously only had a coarse 3:1 step. With Sub-Tick Timing off, `R = 1`
+and behaviour is identical to earlier versions. Swing=0 is bit-identical either
+way (long = short). No new parameter — it follows the host setting automatically.
 
 ---
 
@@ -98,6 +106,15 @@ Output: `<BuzzDir>\Gear\Generators\Pedal Chord.NET.dll`
 ---
 
 ## Changelog
+
+### v1.5.5
+- **Sub-tick swing.** When ReBuzz Sub-Tick Timing is enabled, the arp step
+  clock advances per sub-tick instead of per tick, giving `R×` finer swing and
+  humanize placement (R = SubTicksPerTick). Fixes the low-Speed granularity
+  limit — swing is now smooth at Speed 2–3, not just Speed 4+. Tempo stays
+  locked (long + short = period exactly); Swing=0 is unchanged; with Sub-Tick
+  Timing off, behaviour is identical to v1.5.4. No new parameter. Note-off
+  (Length) timing stays on the tick clock.
 
 ### v1.5.4
 - Rebuilt and retested against **ReBuzz 1827-preview**. No behavioural change.
