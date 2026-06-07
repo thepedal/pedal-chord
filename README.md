@@ -1,4 +1,4 @@
-# Pedal Chord v1.5.6 — ReBuzz Managed Controller Machine
+# Pedal Chord v1.6.0 — ReBuzz Managed Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note in the pattern and
 Pedal Chord fires the full chord (or arpeggiated notes) on any target generator
@@ -49,20 +49,20 @@ Speed is in **pattern ticks** (rows) — exact regardless of BPM or buffer size.
 
 ## Swing
 
-Long and short waits alternate, summing to exactly `2 × Speed` per pair, so
-average tempo is locked at all swing values:
+Long and short waits alternate, summing to exactly `2 × Speed` ticks per pair,
+so average tempo is locked at all swing values and every tempo:
 ```
-period     = 2 × Speed × R          (R = sub-ticks per tick, or 1)
-longUnits  = Round(period × ratio / (ratio + 1))
-shortUnits = period − longUnits
+span       = 2 × Speed                       (ticks)
+longTicks  = span × ratio / (ratio + 1)      (ratio = 1 + Swing/100)
+shortTicks = span − longTicks
 ```
-
-When ReBuzz's **Sub-Tick Timing** is enabled (engine settings), the arp advances
-on each sub-tick rather than each tick, so swing is placed at `R×` finer
-resolution — meaningful swing now works even at low **Speed** (e.g. Speed 2),
-which previously only had a coarse 3:1 step. With Sub-Tick Timing off, `R = 1`
-and behaviour is identical to earlier versions. Swing=0 is bit-identical either
-way (long = short). No new parameter — it follows the host setting automatically.
+The step clock is measured in fractional ticks (`PosInTick / SamplesPerTick`),
+so timing is tempo-locked by construction and independent of ReBuzz's **Sub-Tick
+Timing** setting. Placement resolution is the audio chunk, so swing is smooth
+even at low **Speed** (e.g. Speed 2). Swing=0 gives even spacing (long = short).
+No parameter to set — it just tracks the song position. (Earlier versions placed
+steps by counting host sub-tick edges; that drifted when Sub-Tick Timing was off
+or the tempo changed — see the v1.6.0 changelog.)
 
 ---
 
@@ -106,6 +106,23 @@ Output: `<BuzzDir>\Gear\Generators\Pedal Chord.NET.dll`
 ---
 
 ## Changelog
+
+### v1.6.0
+- **Tempo-locked step clock (fixes tempo/sub-tick drift).** The arp step clock
+  now advances by the musical fraction `PosInTick / SamplesPerTick` instead of
+  counting host sub-tick edges. This is tempo-independent by construction and
+  works the same whether ReBuzz Sub-Tick Timing is on or off. The previous
+  scheme keyed off `SubTicksPerTick`/`CurrentSubTick`, but ReBuzz keeps
+  reporting `SubTicksPerTick > 1` and advancing `CurrentSubTick` even when
+  Sub-Tick Timing is **off** — only the alignment that makes those edges land
+  `R` per tick is tied to the setting. So with Sub-Tick Timing off the edge
+  count no longer matched `R` and the arp drifted (tempo-dependently); changing
+  tempo or toggling the setting threw the timing. The fraction clock removes
+  that dependency entirely. Swing still splits a 2-step span exactly, with
+  smooth placement at low Speed (resolution = the audio chunk), so this
+  supersedes the v1.5.5 sub-tick mechanism without losing fine swing — and the
+  v1.5.6 re-seed behaviour is preserved (a re-seed re-anchors cleanly to the
+  grid). Regression test: `tools/timing_test.py`.
 
 ### v1.5.6
 - **Re-seed timing fix.** When the arp was re-seeded mid-stream by a NoteOn

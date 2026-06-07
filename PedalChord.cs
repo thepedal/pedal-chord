@@ -145,7 +145,7 @@ namespace WDE.PedalChord
         public int[] Notes   = Array.Empty<int>();
         public int   ArpIdx  = 0;
         public int   ArpDir  = 1;
-        public int   ArpTicks       = 0;
+        public int   ArpTicks       = 0;   // legacy/unused since v1.6.0 (fraction clock)
         public int   ArpStepParity  = 0;
 
         public const int MaxSlots = 16;
@@ -187,10 +187,9 @@ namespace WDE.PedalChord
         IParameter _np  = null;
         IParameter _vp  = null;
 
-        int  _prevPit = int.MaxValue;
-        int  _prevSub = -1;          // last SubTickInfo.CurrentSubTick seen
-        int  _curR    = 1;           // step-clock divisor: sub-ticks/tick, or 1
-        bool _firedThisStep = false; // a step already fired on the current newStep edge
+        int    _prevPit = int.MinValue;  // last MasterInfo.PosInTick; sentinel = no prior call
+        double _stepAcc = 0.0;           // fractional ticks accrued toward the next arp step
+        double _stepLen = 0.0;           // length of the current arp step, in fractional ticks
 
         readonly int[] _buildBuf = new int[128]; // per-instance, never shared
 
@@ -430,7 +429,7 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
             _vs.Active         = true;
             _vs.ArpIdx         = (_vs.Mode == 2 || _vs.Mode == 4) ? _vs.Notes.Length - 1 : 0;
             _vs.ArpDir         = (_vs.Mode == 4) ? -1 : 1;
-            _vs.ArpTicks       = 0;
+            _stepAcc           = 0.0;
             _vs.ArpStepParity  = 0;
             _vs.OctOffset      = 0;
             _vs.OctDir         = 1;
@@ -454,7 +453,6 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
         void StepArp(int baseTrack)
         {
             if (_vs.Notes.Length == 0) return;
-            _firedThisStep = true;   // claim this newStep edge (see §10.5)
             int idx = (_vs.Mode == 5) ? _rng.Next(_vs.Notes.Length) : _vs.ArpIdx;
             int midi = _vs.Notes[idx];
             if (_vs.OctWalk != 0)
@@ -470,25 +468,26 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
             _vs.SlotOff[0]   = _vs.Length > 0 ? _vs.Length : 0;
             if (_vs.Mode != 5) AdvArp();
 
-            // Countdown is measured in step units: sub-ticks when the host runs
-            // sub-tick timing (_curR = SubTicksPerTick), else whole ticks
-            // (_curR = 1). Scaling the period by R keeps average tempo locked
-            // (long + short == period exactly) while giving R× finer swing and
-            // humanize resolution — this is what lets swing work at low Speed.
-            int   R      = _curR < 1 ? 1 : _curR;
-            int   period = 2 * _vs.Speed * R;                  // long + short, step units
-            float ratio  = 1f + _vs.Swing / 100f;
-            int   longT  = (int)Math.Round(period * ratio / (ratio + 1.0));
-            int   shortT = Math.Max(1, period - longT);
-            longT        = Math.Max(1, period - shortT);
-            bool  isLong = ((_vs.ArpStepParity + _vs.SwingPhaseVal) % 2 == 0);
-            int   baseT  = isLong ? longT : shortT;
+            // Step length is measured directly in fractional ticks, so timing is
+            // tempo-locked regardless of BPM, TPB, or the Sub-Tick Timing setting.
+            // Swing splits a 2-step span (2 * Speed ticks) into long + short whose
+            // sum is exactly the span; placement resolution is the audio chunk
+            // (sub-tick), giving smooth swing even at low Speed without depending
+            // on the sub-tick edge stream. Humanize jitters the length in ticks.
+            double period = 2.0 * _vs.Speed;                      // long + short, ticks
+            double ratio  = 1.0 + _vs.Swing / 100.0;
+            double longL  = period * ratio / (ratio + 1.0);
+            double shortL = period - longL;
+            bool   isLong = ((_vs.ArpStepParity + _vs.SwingPhaseVal) % 2 == 0);
+            double len    = isLong ? longL : shortL;
             _vs.ArpStepParity = 1 - _vs.ArpStepParity;
 
-            int drift  = _vs.Humanize > 0
-                ? (int)Math.Round(_vs.Speed * R * _vs.Humanize / 200.0) : 0;
-            int jitter = drift > 0 ? _rng.Next(-drift, drift + 1) : 0;
-            _vs.ArpTicks = Math.Max(1, baseT + jitter);
+            if (_vs.Humanize > 0)
+            {
+                double drift = _vs.Speed * _vs.Humanize / 200.0;  // ticks
+                len += (_rng.NextDouble() * 2.0 - 1.0) * drift;
+            }
+            _stepLen = Math.Max(1.0 / 256.0, len);                // floor: never 0/negative
         }
 
         void AdvArp()
@@ -542,39 +541,29 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
         public void Work()
         {
             if (Buzz == null) return;
-            var  sti     = host?.SubTickInfo;
-            int  pit     = host?.MasterInfo?.PosInTick ?? 0;
-            bool newTick = pit < _prevPit;
-            _prevPit     = pit;
+            int pit = host?.MasterInfo?.PosInTick    ?? 0;
+            int spt = host?.MasterInfo?.SamplesPerTick ?? 0;
 
-            // Step clock. When the host runs sub-tick timing the arp advances on
-            // every sub-tick (R = SubTicksPerTick per tick) instead of every tick,
-            // giving R× finer swing/humanize placement. Sub-tick timing off →
-            // SubTicksPerTick is 0 → R = 1 → identical whole-tick behaviour.
-            // PosInTick only resets at the tick boundary, so newTick is still the
-            // tick clock; CurrentSubTick edges give the sub-tick clock.
-            int  R = (sti != null && sti.SubTicksPerTick > 1) ? sti.SubTicksPerTick : 1;
-            _curR  = R;
-            bool newStep;
-            if (R > 1)
+            // Step clock driven off the musical position, not sub-tick edges. The
+            // arp advances by the fraction of a tick elapsed since the last call
+            // (PosInTick / SamplesPerTick), accumulated in fractional ticks. This
+            // is tempo-locked by construction (a tick is a tick at any BPM) and
+            // independent of the host's Sub-Tick Timing setting — unlike counting
+            // CurrentSubTick edges, which the engine only delivers R-per-tick when
+            // Sub-Tick Timing is on, yet still reports SubTicksPerTick > 1 when it
+            // is off (so edge counts then mismatch and the arp drifts). PosInTick
+            // resets only at the tick boundary, so a backwards step is one tick
+            // wrap; chunks never cross a tick boundary, so at most one wrap.
+            bool   first   = _prevPit == int.MinValue;
+            bool   newTick = !first && pit < _prevPit;
+            double dTicks  = 0.0;
+            if (!first && spt > 0)
             {
-                int cs   = sti.CurrentSubTick;
-                newStep  = newTick || cs != _prevSub;   // tick wrap or new sub-tick
-                _prevSub = cs;
+                int d = pit - _prevPit;
+                if (d < 0) d += spt;                 // single tick wrap
+                dTicks = d / (double)spt;
             }
-            else
-            {
-                newStep  = newTick;
-                _prevSub = 0;
-            }
-
-            // At most one step per newStep edge. A NoteOn re-seed (Start→StepArp)
-            // and the per-step countdown must never both consume the same edge,
-            // or the gap after a re-seed comes out one (sub)tick short (§10.5).
-            // Reset here — before any StepArp this call; StepArp sets it; the
-            // decrement below skips the edge when it is already set. Holds however
-            // the host schedules the seeding NoteOn relative to the step edge.
-            if (newStep) _firedThisStep = false;
+            _prevPit = pit;
 
             // _tgt/_np/_vp are resolved on the UI thread only — never touched here.
             int baseTrk = _state.BaseTrack;
@@ -599,7 +588,7 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
                 _vs.PendingReset  = false;
                 _vs.ArpIdx        = (_vs.Mode == 2 || _vs.Mode == 4) ? _vs.Notes.Length - 1 : 0;
                 _vs.ArpDir        = (_vs.Mode == 4) ? -1 : 1;
-                _vs.ArpTicks      = 1;   // fire on the next step boundary
+                _stepAcc          = _stepLen;   // fire promptly on reset
             }
             else _vs.PendingReset = false;
 
@@ -613,10 +602,20 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
                     if (--_vs.SlotOff[s] == 0) FireOff(_vs.SlotTrack[s]);
                 }
 
-            // Arp step runs on the STEP clock (sub-tick when active, else tick).
-            // !_firedThisStep keeps a re-seed and the decrement off the same edge.
-            if (newStep && _vs.Mode != 0 && !_firedThisStep && _vs.ArpTicks > 0 && --_vs.ArpTicks == 0)
-                StepArp(baseTrk);
+            // Arp steps fire when the accumulated musical time reaches the current
+            // step length. Normally fires 0 or 1 times per call; the loop and the
+            // step-length floor in StepArp bound it. A re-seed (Start) resets the
+            // accumulator and returns above, so a seed and a step can't collide.
+            if (_vs.Mode != 0)
+            {
+                _stepAcc += dTicks;
+                int guard = 0;
+                while (_stepLen > 0.0 && _stepAcc >= _stepLen && guard++ < 64)
+                {
+                    _stepAcc -= _stepLen;
+                    StepArp(baseTrk);
+                }
+            }
         }
 
         // ── Stop ──────────────────────────────────────────────────────────────
@@ -634,7 +633,9 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
             _vs.HasNewNote    = false;
             _vs.PendingNote   = 0;
             _vs.PendingReset  = false;
-            _vs.ArpTicks      = 0;
+            _stepAcc          = 0.0;
+            _stepLen          = 0.0;
+            _prevPit          = int.MinValue;   // clean delta on next play
             _vs.ArpStepParity = 0;
             _vs.OctOffset     = 0;
             _vs.OctDir        = 1;
