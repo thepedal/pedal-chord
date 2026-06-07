@@ -190,6 +190,7 @@ namespace WDE.PedalChord
         int  _prevPit = int.MaxValue;
         int  _prevSub = -1;          // last SubTickInfo.CurrentSubTick seen
         int  _curR    = 1;           // step-clock divisor: sub-ticks/tick, or 1
+        bool _firedThisStep = false; // a step already fired on the current newStep edge
 
         readonly int[] _buildBuf = new int[128]; // per-instance, never shared
 
@@ -453,6 +454,7 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
         void StepArp(int baseTrack)
         {
             if (_vs.Notes.Length == 0) return;
+            _firedThisStep = true;   // claim this newStep edge (see §10.5)
             int idx = (_vs.Mode == 5) ? _rng.Next(_vs.Notes.Length) : _vs.ArpIdx;
             int midi = _vs.Notes[idx];
             if (_vs.OctWalk != 0)
@@ -566,6 +568,14 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
                 _prevSub = 0;
             }
 
+            // At most one step per newStep edge. A NoteOn re-seed (Start→StepArp)
+            // and the per-step countdown must never both consume the same edge,
+            // or the gap after a re-seed comes out one (sub)tick short (§10.5).
+            // Reset here — before any StepArp this call; StepArp sets it; the
+            // decrement below skips the edge when it is already set. Holds however
+            // the host schedules the seeding NoteOn relative to the step edge.
+            if (newStep) _firedThisStep = false;
+
             // _tgt/_np/_vp are resolved on the UI thread only — never touched here.
             int baseTrk = _state.BaseTrack;
 
@@ -604,7 +614,8 @@ _vp = _np != null ? FindVelocityParam(_tgt, _np) : null;
                 }
 
             // Arp step runs on the STEP clock (sub-tick when active, else tick).
-            if (newStep && _vs.Mode != 0 && _vs.ArpTicks > 0 && --_vs.ArpTicks == 0)
+            // !_firedThisStep keeps a re-seed and the decrement off the same edge.
+            if (newStep && _vs.Mode != 0 && !_firedThisStep && _vs.ArpTicks > 0 && --_vs.ArpTicks == 0)
                 StepArp(baseTrk);
         }
 

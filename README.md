@@ -1,4 +1,4 @@
-# Pedal Chord v1.5.5 — ReBuzz Managed Controller Machine
+# Pedal Chord v1.5.6 — ReBuzz Managed Controller Machine
 
 A chord and arpeggio trigger for ReBuzz. Write a root note in the pattern and
 Pedal Chord fires the full chord (or arpeggiated notes) on any target generator
@@ -106,6 +106,17 @@ Output: `<BuzzDir>\Gear\Generators\Pedal Chord.NET.dll`
 ---
 
 ## Changelog
+
+### v1.5.6
+- **Re-seed timing fix.** When the arp was re-seeded mid-stream by a NoteOn
+  (a fresh root every bar) the first gap after the seed could come out one
+  (sub)tick short — `Speed − 1` instead of `Speed` at Swing 0. A held note
+  that free-ran was always correct, so a one-chord test missed it. The seed
+  step and the per-step countdown could both consume the same step edge; a
+  per-edge guard now makes them mutually exclusive, so a re-seeded arp plays
+  the same gaps as a free-running one. Applies to the explicit Arp Reset
+  entry point too. No change to free-run timing, Swing, sub-tick behaviour,
+  or any parameter. Regression test added (`tools/reseed_timing_test.py`).
 
 ### v1.5.5
 - **Sub-tick swing.** When ReBuzz Sub-Tick Timing is enabled, the arp step
